@@ -1,0 +1,188 @@
+#!/usr/bin/python3
+# Install as: ~/Library/PDF Services/Save PDF to Obsidian  (filename = menu label)
+#
+# macOS PDF Services script: saves the printed PDF into an Obsidian vault
+# and creates a note embedding it. Shows a single dialog with a note-name
+# field and a multi-line text box for text that goes above the PDF.
+#
+# macOS invokes this with: <job title> <options> <path to generated PDF>
+
+import datetime
+import os
+import re
+import shutil
+import subprocess
+import sys
+import urllib.parse
+import uuid
+
+############## CONFIGURE ##############
+VAULT = os.path.expanduser(
+    "~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Nat's vault"
+)
+ATTACH_SUBDIR = "attachments"  # PDFs land here, relative to vault
+NOTE_SUBDIR = "notes"          # new notes land here, relative to vault
+VAULT_NAME = "Nat's vault"     # for the obsidian:// open URL
+#######################################
+
+STAMP = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+
+# One native dialog (name field + multi-line text view) via AppleScriptObjC.
+# Gets the prefill title and an output delimiter as osascript arguments;
+# returns "<name><delimiter><body>", or errors out (-128) on Cancel.
+DIALOG_SCRIPT = '''
+use framework "AppKit"
+use scripting additions
+
+on run argv
+    set prefill to item 1 of argv
+    set delim to item 2 of argv
+
+    set theApp to current application's NSApplication's sharedApplication()
+    (theApp's setActivationPolicy:1) -- NSApplicationActivationPolicyAccessory
+
+    -- osascript has no menu bar, so Cmd-V/C/X/A/Z do nothing by default;
+    -- an Edit menu (never shown) provides the standard key equivalents
+    set mainMenu to current application's NSMenu's alloc()'s initWithTitle:"MainMenu"
+    set editItem to (mainMenu's addItemWithTitle:"Edit" action:(missing value) keyEquivalent:"")
+    set editMenu to current application's NSMenu's alloc()'s initWithTitle:"Edit"
+    (editMenu's addItemWithTitle:"Undo" action:"undo:" keyEquivalent:"z")
+    (editMenu's addItemWithTitle:"Cut" action:"cut:" keyEquivalent:"x")
+    (editMenu's addItemWithTitle:"Copy" action:"copy:" keyEquivalent:"c")
+    (editMenu's addItemWithTitle:"Paste" action:"paste:" keyEquivalent:"v")
+    (editMenu's addItemWithTitle:"Select All" action:"selectAll:" keyEquivalent:"a")
+    (mainMenu's setSubmenu:editMenu forItem:editItem)
+    (theApp's setMainMenu:mainMenu)
+
+    set alert to current application's NSAlert's alloc()'s init()
+    (alert's setMessageText:"Save to Obsidian")
+    (alert's addButtonWithTitle:"Save")
+    (alert's addButtonWithTitle:"Cancel")
+
+    set container to current application's NSView's alloc()'s initWithFrame:(current application's NSMakeRect(0, 0, 420, 226))
+
+    set nameLabel to current application's NSTextField's labelWithString:"Note name:"
+    (nameLabel's setFrame:(current application's NSMakeRect(0, 204, 420, 16)))
+
+    set nameField to current application's NSTextField's alloc()'s initWithFrame:(current application's NSMakeRect(0, 176, 420, 24))
+    (nameField's setStringValue:prefill)
+
+    set bodyLabel to current application's NSTextField's labelWithString:"Note text (goes above the PDF):"
+    (bodyLabel's setFrame:(current application's NSMakeRect(0, 152, 420, 16)))
+
+    set scrollView to current application's NSScrollView's alloc()'s initWithFrame:(current application's NSMakeRect(0, 0, 420, 144))
+    (scrollView's setHasVerticalScroller:true)
+    (scrollView's setBorderType:2) -- NSBezelBorder
+
+    set textView to current application's NSTextView's alloc()'s initWithFrame:(current application's NSMakeRect(0, 0, 420, 144))
+    (textView's setRichText:false)
+    (textView's setAllowsUndo:true)
+    (textView's setFont:(current application's NSFont's systemFontOfSize:13))
+    (textView's setVerticallyResizable:true)
+    (textView's setAutoresizingMask:2) -- NSViewWidthSizable
+    (scrollView's setDocumentView:textView)
+
+    (container's addSubview:nameLabel)
+    (container's addSubview:nameField)
+    (container's addSubview:bodyLabel)
+    (container's addSubview:scrollView)
+    (alert's setAccessoryView:container)
+
+    -- Make Cmd-Z sane inside the modal alert. The window's undo manager
+    -- only closes undo groups in the default run loop mode, so without this
+    -- everything typed lands in one group and Cmd-Z wipes it all at once.
+    -- The timers periodically break the typing coalescing so undo steps
+    -- back through ~1-second bursts of typing instead of whole runs.
+    set win to alert's |window|()
+    ((win's undoManager())'s setRunLoopModes:{"kCFRunLoopDefaultMode", "NSModalPanelRunLoopMode"})
+    set fieldEd to (win's fieldEditor:true forObject:nameField)
+    (fieldEd's setAllowsUndo:true)
+    set runLoop to current application's NSRunLoop's currentRunLoop()
+    repeat with target in {textView, fieldEd}
+        set t to (current application's NSTimer's timerWithTimeInterval:1.0 target:target selector:"breakUndoCoalescing" userInfo:(missing value) repeats:true)
+        (runLoop's addTimer:t forMode:"NSModalPanelRunLoopMode")
+    end repeat
+
+    (win's setInitialFirstResponder:nameField)
+    (nameField's setNextKeyView:textView)
+
+    (theApp's activateIgnoringOtherApps:true)
+    set resp to alert's runModal()
+    if (resp as integer) is not 1000 then error number -128 -- not the Save button
+
+    set noteName to nameField's stringValue() as text
+    set noteBody to textView's |string|() as text
+    return noteName & delim & noteBody
+end run
+'''
+
+
+def sanitize(name):
+    s = re.sub(r'[/\\:*?"<>|#^\[\]]', "-", name)
+    s = re.sub(r"-{2,}", "-", s)
+    s = s.strip(" .-")
+    return s or f"Printed-{STAMP}"
+
+
+def ask_user(prefill):
+    """Show the dialog; return (name, body), or None if cancelled."""
+    delim = uuid.uuid4().hex
+    proc = subprocess.run(
+        ["osascript", "-", prefill, delim],
+        input=DIALOG_SCRIPT,
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0 or delim not in proc.stdout:
+        return None
+    out = proc.stdout
+    if out.endswith("\n"):  # osascript adds one trailing newline to the result
+        out = out[:-1]
+    name, _, body = out.partition(delim)
+    return name, body
+
+
+def main():
+    if len(sys.argv) < 2:
+        sys.exit("usage: <job title> [options] <pdf path>")
+    title = sys.argv[1] if len(sys.argv) > 2 else "Printed"
+    src_pdf = sys.argv[-1]
+
+    result = ask_user(sanitize(title))
+    if result is None:
+        return  # cancelled
+    name, body = result
+    if not name.strip():
+        return  # cancel-on-empty, checked on the raw input
+
+    safe = sanitize(name)
+    pdf_name = f"{safe} {STAMP}.pdf"
+    attach_dir = os.path.join(VAULT, ATTACH_SUBDIR)
+    note_dir = os.path.join(VAULT, NOTE_SUBDIR)
+    os.makedirs(attach_dir, exist_ok=True)
+    os.makedirs(note_dir, exist_ok=True)
+
+    shutil.copy(src_pdf, os.path.join(attach_dir, pdf_name))
+
+    note_path = os.path.join(note_dir, f"{safe}.md")
+    if os.path.exists(note_path):
+        note_path = os.path.join(note_dir, f"{safe} {STAMP}.md")
+
+    with open(note_path, "w") as f:
+        if body.strip():
+            f.write(body.rstrip() + "\n\n")
+        else:
+            f.write("\n")  # blank line keeps the embed off the note's first line
+        f.write(f"![[{pdf_name}]]\n")  # change ![[...]] to [[...]] for a plain link
+
+    # Open the note in Obsidian
+    rel_noext = os.path.relpath(note_path, VAULT)[: -len(".md")]
+    url = (
+        f"obsidian://open?vault={urllib.parse.quote(VAULT_NAME)}"
+        f"&file={urllib.parse.quote(rel_noext)}"
+    )
+    subprocess.run(["open", url])
+
+
+if __name__ == "__main__":
+    main()
