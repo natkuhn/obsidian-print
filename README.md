@@ -135,6 +135,10 @@ open -a "build/Save PDF to Obsidian.app" --env OBSIDIAN_PRINT_REGISTRY=/path/to/
   --env OBSIDIAN_PRINT_STATE=/tmp/state.json --env OBSIDIAN_PRINT_NO_OPEN=1 some.pdf
 ```
 
+## License
+
+MIT — see [LICENSE](LICENSE).
+
 ## Credits
 
 Written by Nat Kuhn with Claude. The original two-dialog shell script was
